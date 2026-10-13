@@ -1,0 +1,16 @@
+{
+  "servers": {
+    "kubernetes": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "kubernetes-mcp-server@latest",
+        "--cluster-provider",
+        "kubeconfig",
+        "--toolsets",
+        "core,config"
+      ]
+    }
+  }
+}
