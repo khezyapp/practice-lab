@@ -1,0 +1,201 @@
+# =============================================================================
+# Step 05 - Services, and the two other workloads that prove the point.
+#
+#   kubectl apply -f labs/05-service.yaml
+#
+# Because Pod IPs are ephemeral, nothing may address a Pod directly. A Service
+# gives a group of Pods ONE stable DNS name and virtual IP, and load-balances
+# only to Pods whose readiness probe is passing.
+#
+# Note the asymmetry in this file - it is deliberate and it is a lesson:
+#   * taskflow-api  HAS a Service (the Ingress and other Pods must reach it)
+#   * redis         HAS a Service (the API and the worker must reach it)
+#   * worker        has NO Service (nothing ever needs to call the worker)
+# Not every workload needs to be addressable. Adding a Service "just in case"
+# is a smell, not a habit.
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskflow-api
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-api
+    app.kubernetes.io/part-of: taskflow
+spec:
+  type: ClusterIP                     # cluster-internal only; the Ingress fronts it
+  selector:
+    app.kubernetes.io/name: taskflow-api    # <-- this is the whole "wiring"
+  ports:
+    - name: http
+      port: 80                        # what clients call
+      targetPort: http                # the NAMED container port -> resolves to 8080
+      protocol: TCP
+
+# -----------------------------------------------------------------------------
+# Redis: the cache/queue. This is a Deployment on purpose, because this Redis
+# holds no data worth keeping (persistence is switched off below). The moment you
+# need the queue to survive a restart you must move this to a StatefulSet with a
+# volumeClaimTemplate - see docs/concepts/07-statefulset.md.
+# -----------------------------------------------------------------------------
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: taskflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/component: cache
+        app.kubernetes.io/part-of: taskflow
+    spec:
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999                # the `redis` user inside the official image
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # Persistence deliberately off: this is a cache/queue, not a database.
+          args: ["redis-server", "--save", "", "--appendonly", "no"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            requests: { cpu: "50m",  memory: "64Mi" }
+            limits:   { cpu: "300m", memory: "256Mi" }
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: redis }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}                # scratch only; deleted with the Pod
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: taskflow
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+
+# -----------------------------------------------------------------------------
+# The worker: same image as the API, different entry point. No Service, no
+# Ingress - it is a consumer, addressed by nobody. It is a Deployment rather than
+# a Job because it is meant to run forever.
+# -----------------------------------------------------------------------------
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskflow-worker
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: taskflow
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taskflow-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: taskflow
+        app.kubernetes.io/version: "1.0.0"
+    spec:
+      serviceAccountName: taskflow-api
+      # Long enough for the worker to finish the job in flight on SIGTERM.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: taskflow-api:1.0.0
+          # Overrides the image ENTRYPOINT (gunicorn) - same image, new mode.
+          command: ["python", "app.py", "worker"]
+          envFrom:
+            - configMapRef:
+                name: taskflow-config
+            - secretRef:
+                name: taskflow-secret
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+          # A queue consumer has no HTTP port to probe, so it publishes a
+          # heartbeat file and the probe checks that the loop is still turning.
+          # "Is the process alive?" is the only question liveness may ask.
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os,sys,time; f=os.environ.get('HEARTBEAT_FILE','/tmp/worker-heartbeat'); sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f) < 120 else 1)"
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+
+# -----------------------------------------------------------------------------
+# Load balancing is per-CONNECTION, not per-request, and it happens in the
+# client node's kernel (kube-proxy/eBPF) - there is no central proxy.
+#
+# `kubectl port-forward svc/taskflow-api 8080:80` picks ONE Pod and sticks to it,
+# so it does NOT prove the Service works. To prove it, call the Service from
+# another Pod:
+#
+#   kubectl run tmp --rm -it --image=busybox:1.36 --restart=Never -n taskflow -- sh
+#   # inside:
+#   nslookup taskflow-api
+#   for i in 1 2 3 4 5 6; do wget -qO- http://taskflow-api/api/whoami; echo; done
+#
+# Six different pod names = load balancing working.
+# -----------------------------------------------------------------------------

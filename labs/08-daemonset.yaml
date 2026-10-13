@@ -1,0 +1,156 @@
+# =============================================================================
+# Step 08 - the DaemonSet: one Pod on every Node.
+#
+#   kubectl apply -f labs/08-daemonset.yaml
+#
+# NOTE THE NAMESPACE: this lives in `node-agents`, not `taskflow`.
+#
+# That is not a stylistic choice. Pod Security Admission is enforced per
+# namespace, and `baseline` - the level the `taskflow` namespace uses - forbids
+# `hostPath` volumes, because host filesystem access is a privilege escalation
+# path. A node-level agent needs host access by definition, and Pod Security
+# Admission has no per-Pod exemption, so the standard solution is namespace
+# splitting: applications stay hardened, infrastructure agents get their own
+# namespace with its own (looser) level and its own RBAC.
+#
+# A DaemonSet has no `replicas` field - the Node count IS the replica count, and
+# Nodes that join later get a Pod automatically. That is what makes it the right
+# controller for node-level agents:
+#
+#   log shippers (Fluent Bit / Filebeat / Vector), node-exporter, the CNI agent,
+#   the CSI node plugin, kube-proxy, security/host agents.
+#
+# This is a simplified stand-in for a log shipper: it reads the Node's /var/log
+# (read-only) and reports what it can see. Swap the image for Fluent Bit and the
+# command for a real config and this is production code.
+# =============================================================================
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-log-agent
+  namespace: node-agents
+  labels:
+    app.kubernetes.io/name: node-log-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: taskflow
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: node-log-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One Node at a time. Upgrading every node agent simultaneously is how you
+      # take a whole cluster out - especially if the agent is the CNI.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: node-log-agent
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/part-of: taskflow
+    spec:
+      # Scope: Linux Nodes only. This is also how you would target only GPU Nodes,
+      # or only Nodes with a specific label (e.g. node-pool=logging).
+      nodeSelector:
+        kubernetes.io/os: linux
+
+      # Role taints are NOT tolerated by default. Without these two a
+      # single-node minikube (whose only Node is the control plane) would report
+      # DESIRED 0 and you would see no Pod at all.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: log-agent
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "[agent] starting node=$NODE_NAME pod=$POD_NAME"
+              while true; do
+                count=$(ls /host/var/log 2>/dev/null | wc -l)
+                echo "[agent] $(date +%Y-%m-%dT%H:%M:%S) node=$NODE_NAME visible-log-entries=$count"
+                sleep 30
+              done
+          # Node metadata, injected by the downward API. DaemonSets are exactly
+          # where you need to know WHICH node you are running on.
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: NODE_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.hostIP }
+          resources:
+            # Every Node pays this cost, so keep it small and honest.
+            requests: { cpu: "20m",  memory: "32Mi" }
+            limits:   { cpu: "100m", memory: "64Mi" }
+          # There is no port to probe here, so the agent is probed with a trivial
+          # shell check on the state it depends on. Real agents (Fluent Bit,
+          # node-exporter) expose a metrics/health endpoint instead - which is
+          # better, because it detects a WEDGED agent, not just a running one.
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "test -d /host/var/log"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            # READ-ONLY host access. This is the single line that forces this
+            # workload into its own namespace: `baseline` Pod Security (used by
+            # `taskflow`) rejects hostPath volumes outright. Read-only is the
+            # difference between an observability agent and a Node compromise.
+            - name: host-log
+              mountPath: /host/var/log
+              readOnly: true
+
+      volumes:
+        - name: host-log
+          hostPath:
+            path: /var/log
+            type: Directory        # fail loudly if the Node has no /var/log
+
+      # Never write application state to hostPath: it is Node-local, unbacked,
+      # and changes if the Pod is rescheduled to a different Node.
+
+# -----------------------------------------------------------------------------
+# Verify that "one per Node" is literally true:
+#
+#   kubectl get daemonset -n node-agents
+#     DESIRED = the number of eligible Nodes (not a number you chose)
+#   kubectl get pods -n node-agents -o wide -l app.kubernetes.io/name=node-log-agent
+#     each NODE value appears exactly once
+#
+# On a single-node cluster you will see exactly one Pod. That is correct. To see
+# the real behaviour, create a multi-node cluster:
+#
+#   minikube start -p taskflow3 --nodes=3 --cpus=4 --memory=5120
+#   kubectl --context taskflow3 apply -f labs/01-namespace.yaml
+#   kubectl --context taskflow3 apply -f labs/08-daemonset.yaml
+#   kubectl --context taskflow3 get pods -n node-agents -o wide -l app.kubernetes.io/name=node-log-agent
+#     -> three Pods, one per Node, with no replicas field anywhere.
+#
+# And prove the namespace split is real - try to put this DaemonSet back into the
+# hardened application namespace:
+#
+#   kubectl get ns taskflow -o jsonpath='{.metadata.labels}'
+#   # then copy this file, set namespace: taskflow, and apply
+#   # -> rejected: violates PodSecurity "baseline:latest": hostPath volumes
+# -----------------------------------------------------------------------------

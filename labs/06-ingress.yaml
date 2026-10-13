@@ -1,0 +1,89 @@
+# =============================================================================
+# Step 06 - the Ingress: one front door instead of many exposed Services.
+#
+#   kubectl apply -f labs/06-ingress.yaml
+#
+# REMINDER: an Ingress object is only a ROUTING RULE. It does nothing at all
+# unless an Ingress CONTROLLER (ingress-nginx) is installed and running. If your
+# Ingress has no ADDRESS, that is the reason.
+#
+#   kubectl get ingressclass
+#   kubectl get pods -n ingress-nginx
+# =============================================================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: taskflow
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow
+    app.kubernetes.io/part-of: taskflow
+  annotations:
+    # --- controller-specific tuning (nginx only; NOT portable between controllers)
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    # No rewrite annotation: the app serves /api/... itself, so /api/tasks must
+    # reach the backend unmodified. Adding `rewrite-target: /` here would strip
+    # "/api" and every request would 404 - the most common Ingress mistake.
+spec:
+  # Which controller must honour this object. Omit it in a cluster with no
+  # default IngressClass and your Ingress is silently ignored.
+  ingressClassName: nginx
+
+  rules:
+    # Host-based + path-based routing. One IP, one certificate, many services.
+    - host: taskflow.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix          # matches /api, /api/tasks, /api/tasks/5
+            backend:
+              service:
+                name: taskflow-api    # the SERVICE name...
+                port:
+                  number: 80          # ...and the SERVICE port, not the container port
+          - path: /
+            pathType: Prefix          # a landing path so the root URL is not a 404
+            backend:
+              service:
+                name: taskflow-api
+                port:
+                  number: 80
+
+    # A second hostname routed to the same Service: this is how you would give
+    # the same app an "api." alias, or route admin.taskflow.local elsewhere.
+    - host: api.taskflow.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: taskflow-api
+                port:
+                  number: 80
+
+  # Optional catch-all for requests whose Host matches no rule above.
+  # Uncomment to see the difference between "no rule matched" (404) and a
+  # deliberate default backend.
+  #
+  # defaultBackend:
+  #   service:
+  #     name: taskflow-api
+  #     port:
+  #       number: 80
+
+# -----------------------------------------------------------------------------
+# TLS looks like this (the Secret must contain tls.crt and tls.key, and in a real
+# cluster cert-manager creates and rotates it for you):
+#
+#   spec:
+#     tls:
+#       - hosts: ["taskflow.local"]
+#         secretName: taskflow-tls
+#
+#   kubectl create secret tls taskflow-tls -n taskflow --cert=taskflow.crt --key=taskflow.key
+# -----------------------------------------------------------------------------

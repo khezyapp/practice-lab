@@ -1,0 +1,232 @@
+# =============================================================================
+# Step 11 - deliberately broken workloads, for debugging practice.
+#
+#   kubectl apply -f labs/11-broken-workloads.yaml
+#
+# Every object here is broken in exactly ONE way, and each produces a DIFFERENT
+# Kubernetes failure mode. Your job in step 11 is to look at the symptoms and
+# work out which layer is at fault - without reading this file's comments first.
+#
+# Summary of what each one does (spoilers):
+#   broken-image      -> ImagePullBackOff            (a tag that does not exist)
+#   broken-config     -> CreateContainerConfigError  (a ConfigMap key that does not exist)
+#   broken-probe      -> CrashLoopBackOff            (liveness probe pointed at a 404)
+#   broken-readiness  -> Running 0/1, no endpoints   (readiness probe pointed at a 404)
+#   broken-scheduling -> Pending                     (a nodeSelector nothing matches)
+#   broken-service    -> Endpoints: <none>           (a selector typo)
+#
+# Clean up when you are done:
+#   kubectl delete -f labs/11-broken-workloads.yaml
+# =============================================================================
+
+# 1. The image tag does not exist. Pod stays Pending-ish, container status is
+#    Waiting with reason ImagePullBackOff, and Events show the registry response.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken-image
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: broken-image
+    app.kubernetes.io/component: broken
+    app.kubernetes.io/part-of: taskflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: broken-image
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: broken-image
+        app.kubernetes.io/component: broken
+        app.kubernetes.io/part-of: taskflow
+    spec:
+      containers:
+        - name: api
+          image: taskflow-api:9.9.9       # <-- this tag was never built
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+
+# 2. The ConfigMap exists, but the key it asks for does not. This fails BEFORE
+#    the container is even created, so there are no logs - only Events.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken-config
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: broken-config
+    app.kubernetes.io/component: broken
+    app.kubernetes.io/part-of: taskflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: broken-config
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: broken-config
+        app.kubernetes.io/component: broken
+        app.kubernetes.io/part-of: taskflow
+    spec:
+      containers:
+        - name: api
+          image: taskflow-api:1.0.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: APP_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: taskflow-config
+                  key: THIS_KEY_DOES_NOT_EXIST    # <-- CreateContainerConfigError
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+
+# 3. Liveness probe points at a path that returns 404. The kubelet restarts the
+#    container over and over: CrashLoopBackOff. Note the restart count climbing,
+#    and note that the app logs look perfectly healthy - it started fine.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken-probe
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: broken-probe
+    app.kubernetes.io/component: broken
+    app.kubernetes.io/part-of: taskflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: broken-probe
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: broken-probe
+        app.kubernetes.io/component: broken
+        app.kubernetes.io/part-of: taskflow
+    spec:
+      containers:
+        - name: api
+          image: taskflow-api:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          livenessProbe:
+            httpGet: { path: /this-path-does-not-exist, port: http }   # <-- 404
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+
+# 4. Readiness probe points at a 404, but there is NO liveness probe. The
+#    container keeps running happily, is never restarted... and never becomes
+#    Ready, so it is never added to the Service's endpoints. Production traffic
+#    gets 503 while `kubectl get pods` shows a cheerful `Running`.
+#    This is the subtlest failure in the file and the one you will meet most often.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken-readiness
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: broken-readiness
+    app.kubernetes.io/component: broken
+    app.kubernetes.io/part-of: taskflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: broken-readiness
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: broken-readiness
+        app.kubernetes.io/component: broken
+        app.kubernetes.io/part-of: taskflow
+    spec:
+      containers:
+        - name: api
+          image: taskflow-api:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /this-path-does-not-exist, port: http }   # <-- 404
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+
+# 5. The Pod can never be scheduled: the nodeSelector demands a node name that
+#    does not exist. It stays Pending forever and NOTHING is wrong with the image,
+#    the config or the app. `kubectl describe pod` names the reason precisely.
+#    (A resource-based Pending - "Insufficient cpu" - looks the same and is the
+#    other half of this lesson.)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken-scheduling
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: broken-scheduling
+    app.kubernetes.io/component: broken
+    app.kubernetes.io/part-of: taskflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: broken-scheduling
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: broken-scheduling
+        app.kubernetes.io/component: broken
+        app.kubernetes.io/part-of: taskflow
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: this-node-does-not-exist     # <-- matches nothing
+      containers:
+        - name: api
+          image: taskflow-api:1.0.0
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+
+# 6. A Service whose selector has a typo. It is 100% valid YAML, it routes
+#    perfectly, and it will never have a single endpoint. The Ingress pointing
+#    here would return 503, and nothing in the Service itself looks wrong.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: broken-service
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: broken-service
+    app.kubernetes.io/component: broken
+    app.kubernetes.io/part-of: taskflow
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: taskflow-apii     # <-- typo: no Pod has this label
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

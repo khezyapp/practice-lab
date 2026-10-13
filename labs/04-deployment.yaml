@@ -1,0 +1,138 @@
+# =============================================================================
+# Step 04 - the API as a Deployment.
+#
+#   kubectl apply -f labs/04-deployment.yaml
+#
+# Everything a production Deployment needs, and nothing more: replicas, probes,
+# resources, a rolling-update strategy that cannot drop below full capacity, a
+# drain-aware shutdown, and node spreading.
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskflow-api
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-api
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: taskflow
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5                  # keep 5 old ReplicaSets for rollback
+
+  # selector is IMMUTABLE. It must match template labels or the API rejects this.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-api
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                          # +1 extra Pod during a rollout
+      maxUnavailable: 0                    # never go below 3 Ready Pods
+  minReadySeconds: 5                       # a new Pod must stay Ready for 5s
+  progressDeadlineSeconds: 300             # fail the rollout if it stalls
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taskflow-api
+        app.kubernetes.io/component: backend
+        app.kubernetes.io/part-of: taskflow
+        app.kubernetes.io/version: "1.0.0"
+    spec:
+      serviceAccountName: taskflow-api     # no API token mounted (see step 02)
+      terminationGracePeriodSeconds: 30
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Spread replicas across nodes where possible. `preferred` degrades
+      # gracefully on a single-node cluster instead of leaving Pods Pending.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: taskflow-api
+
+      containers:
+        - name: api
+          image: taskflow-api:1.0.0
+          imagePullPolicy: IfNotPresent     # required for locally-built images
+          ports:
+            - name: http
+              containerPort: 8080
+
+          # Every key of both objects becomes an environment variable.
+          envFrom:
+            - configMapRef:
+                name: taskflow-config
+            - secretRef:
+                name: taskflow-secret
+
+          # Downward API: Pod/Node metadata injected as env vars, so
+          # GET /api/whoami can tell you which replica served the request.
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+
+          # startupProbe: gives a slow boot a long budget WITHOUT weakening the
+          # liveness probe. Until it passes, liveness and readiness are disabled.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30             # up to 60s to start
+          # readinessProbe: controls Service endpoints. Failing does NOT restart.
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # livenessProbe: checks ONLY the process itself. Never a dependency.
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          # Let endpoint removal propagate before the process stops accepting
+          # connections, so a rolling update does not produce stray 502s.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+
+# -----------------------------------------------------------------------------
+# Why each field exists:
+#
+#   replicas: 3 ............ one node drain must not end your availability
+#   maxUnavailable: 0 ...... zero-downtime only works WITH a readiness probe
+#   startupProbe ........... avoids the "initialDelaySeconds too short" restart loop
+#   requests/limits ........ schedules sanely and protects the node
+#   podAntiAffinity ........ a single node failure should not take every replica
+#   preStop + grace period . drains in-flight requests instead of dropping them
+#   revisionHistoryLimit ... rollback works, history does not grow forever
+#
+# Try this once it is running:
+#   kubectl get pods -n taskflow -o wide
+#   kubectl get pod <pod> -n taskflow -o jsonpath='{.metadata.ownerReferences}'
+#     -> Pod -> ReplicaSet -> Deployment: the ownership chain, visible.
+# -----------------------------------------------------------------------------

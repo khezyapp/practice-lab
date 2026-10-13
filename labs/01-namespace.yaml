@@ -1,0 +1,116 @@
+# =============================================================================
+# Step 02 - the namespace and the guard rails for everything that follows.
+#
+#   kubectl apply -f labs/01-namespace.yaml
+#
+# In the application namespace:
+#   1. Namespace      - the scope for names, policies and quotas
+#   2. ServiceAccount - a dedicated identity (instead of the shared `default`)
+#   3. ResourceQuota  - a hard ceiling on what the namespace can consume
+#   4. LimitRange     - default/min/max resources for each container
+#
+# Plus a second namespace, `node-agents`, for the privileged DaemonSet in step 08
+# (the reason is explained at the bottom of this file - it is a lesson in itself).
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: taskflow
+  labels:
+    app.kubernetes.io/part-of: taskflow
+    # Pod Security Admission.
+    #
+    # `baseline` blocks the known privilege escalations AND forbids hostPath
+    # volumes, hostNetwork, hostPID and privileged containers. It is the right
+    # level for application namespaces, and it is why the DaemonSet in step 08
+    # lives in its OWN namespace (`node-agents`) instead of this one: a node-level
+    # agent needs host access, which is exactly what `baseline` forbids.
+    #
+    # `warn` and `audit` are deliberately stricter than `enforce`: every Pod that
+    # would fail the `restricted` profile produces a warning on apply and is
+    # recorded in the audit log, without being blocked. Read those warnings - they
+    # tell you what a hardened production namespace would reject.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+
+---
+# A dedicated identity for the API. Most applications never call the Kubernetes
+# API, so we switch the token off entirely - one less credential to leak.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: taskflow-api
+  namespace: taskflow
+automountServiceAccountToken: false
+
+---
+# A hard ceiling for the whole namespace. Exceeding it makes the API server
+# REJECT the create - which is exactly what you want, rather than discovering at
+# 3am that a runaway job consumed the node pool.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: taskflow-quota
+  namespace: taskflow
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "30"
+    services: "10"
+    persistentvolumeclaims: "6"
+    requests.storage: 20Gi
+    count/jobs.batch: "20"
+    count/cronjobs.batch: "10"
+
+---
+# IMPORTANT: once a quota covers requests.cpu, EVERY Pod in the namespace must
+# either declare requests or get them injected. LimitRange does the injecting.
+# Add a quota without a LimitRange and every Pod creation that omits resources
+# starts failing - the classic first-quota surprise.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: taskflow-defaults
+  namespace: taskflow
+spec:
+  limits:
+    - type: Container
+      default:        { cpu: "200m", memory: "256Mi" }
+      defaultRequest: { cpu: "100m", memory: "128Mi" }
+      max:            { cpu: "2",    memory: "2Gi" }
+      min:            { cpu: "10m",  memory: "32Mi" }
+
+---
+# ---------------------------------------------------------------------------
+# A SEPARATE namespace for node-level agents, and the reason is a real one:
+#
+#   Pod Security Admission is enforced PER NAMESPACE, and `baseline` (correctly)
+#   forbids hostPath volumes. A node agent - a log shipper, node-exporter, the
+#   CNI, the CSI node plugin - fundamentally needs host access, so it cannot live
+#   in a hardened application namespace.
+#
+#   There is no per-Pod exemption, so the standard solution is namespace
+#   splitting: application namespaces stay `baseline`/`restricted`, and
+#   infrastructure namespaces that genuinely need privilege get their own
+#   namespace, their own RBAC, and often their own admission policy.
+#
+#   Try to prove this to yourself later: apply labs/08-daemonset.yaml into
+#   `taskflow` instead and read the rejection message.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: node-agents
+  labels:
+    app.kubernetes.io/part-of: taskflow
+    # Enforced at `privileged` because host access is the entire job of these
+    # agents. Warnings and audit stay at `restricted` so the violations are
+    # always visible in logs - "allowed" is not the same as "unnoticed".
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

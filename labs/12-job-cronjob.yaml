@@ -1,0 +1,150 @@
+# =============================================================================
+# Step 12 - work that must run and FINISH, on a schedule.
+#
+#   kubectl apply -f labs/12-job-cronjob.yaml
+#
+# A CronJob creates Jobs on a schedule; each Job creates Pods. It is a scheduler,
+# not a workflow engine - it has no notion of steps, dependencies or retries
+# between stages. (For DAGs use Argo Workflows or Tekton.)
+#
+# The schedule below is */5 (every 5 minutes) so you can actually watch it run
+# during the lab. Production would be "0 2 * * *" - 02:00 nightly.
+#
+# !! NETWORK POLICY EXERCISE !!
+# Under the default-deny posture from step 09, this Job has NO egress allowed, so
+# its first runs will fail with a database connection error. That is intentional:
+# adding a workload without adding its NetworkPolicy is the single most common
+# operational mistake with network policies. The fix is commented out at the
+# bottom of this file - work out the error first, then uncomment it.
+# =============================================================================
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: taskflow-cleanup
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-cleanup
+    app.kubernetes.io/component: batch
+    app.kubernetes.io/part-of: taskflow
+spec:
+  schedule: "*/5 * * * *"
+  timeZone: "UTC"              # ALWAYS be explicit: the default is UTC, and
+                               # "2am" that means 2am UTC is a classic incident
+  concurrencyPolicy: Forbid    # if the previous run is still going, skip this one
+                               # - without this a slow job overlaps itself
+  startingDeadlineSeconds: 120 # give up on a missed schedule instead of
+                               # stampeding the cluster with catch-up Jobs
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  suspend: false
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 180     # a hung job must not block future runs
+      ttlSecondsAfterFinished: 600   # auto-clean so Jobs do not accumulate
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: taskflow-cleanup
+            app.kubernetes.io/component: batch
+            app.kubernetes.io/part-of: taskflow
+        spec:
+          restartPolicy: OnFailure   # REQUIRED for a Job: Never or OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: cleanup
+              image: taskflow-api:1.0.0
+              imagePullPolicy: IfNotPresent
+              command: ["python", "app.py", "cleanup"]
+              envFrom:
+                - configMapRef: { name: taskflow-config }
+                - secretRef:    { name: taskflow-secret }
+              resources:
+                requests: { cpu: "100m", memory: "128Mi" }
+                limits:   { cpu: "500m", memory: "256Mi" }
+
+# -----------------------------------------------------------------------------
+# Test it without waiting for 02:00 (or for the next 5-minute tick):
+#
+#   kubectl create job --from=cronjob/taskflow-cleanup manual-cleanup-1 -n taskflow
+#   kubectl logs job/manual-cleanup-1 -n taskflow
+#
+# Idempotency is not optional. This job deletes rows older than RETENTION_DAYS,
+# so running it twice deletes the same rows (nothing) the second time - safe.
+# Never write a scheduled job whose second execution corrupts data: every job
+# here WILL eventually run twice (retries, restarts, manual re-runs, overlapping
+# schedules on a controller restart).
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# A parallel Job - the other common shape. Useful when you have a fixed amount of
+# work to chew through:
+#
+#   apiVersion: batch/v1
+#   kind: Job
+#   metadata:
+#     name: taskflow-batch-report
+#     namespace: taskflow
+#   spec:
+#     completions: 6          # 6 Pods must succeed in total
+#     parallelism: 3          # ...3 at a time
+#     backoffLimit: 3
+#     activeDeadlineSeconds: 900
+#     template:
+#       spec:
+#         restartPolicy: Never
+#         containers:
+#           - name: report
+#             image: taskflow-api:1.0.0
+#             command: ["python","app.py","migrate"]   # stand-in for real work
+#             envFrom:
+#               - configMapRef: { name: taskflow-config }
+#               - secretRef:    { name: taskflow-secret }
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# THE FIX for the NetworkPolicy exercise - uncomment this whole block and apply
+# the file again. Two halves are needed: where the Job may GO, and where it may
+# ARRIVE. Allowing only one side is the second most common NetworkPolicy mistake.
+# =============================================================================
+#
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: allow-cleanup-egress
+#   namespace: taskflow
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app.kubernetes.io/name: taskflow-cleanup
+#   policyTypes: [Egress]
+#   egress:
+#     - to:
+#         - podSelector:
+#             matchLabels:
+#               app.kubernetes.io/name: postgres
+#       ports:
+#         - { protocol: TCP, port: 5432 }
+# ---
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: allow-cleanup-into-postgres
+#   namespace: taskflow
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app.kubernetes.io/name: postgres
+#   policyTypes: [Ingress]
+#   ingress:
+#     - from:
+#         - podSelector:
+#             matchLabels:
+#               app.kubernetes.io/name: taskflow-cleanup
+#       ports:
+#         - { protocol: TCP, port: 5432 }

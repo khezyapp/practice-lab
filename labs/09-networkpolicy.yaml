@@ -1,0 +1,308 @@
+# =============================================================================
+# Step 09 - Egress and NetworkPolicies: stop trusting the network by default.
+#
+#   kubectl apply -f labs/09-networkpolicy.yaml
+#
+# Read the file top to bottom; the ORDER matters conceptually even though
+# Kubernetes treats all policies as one additive set.
+#
+# Three rules of NetworkPolicy that people get wrong:
+#
+#   1. No policy = no restriction. Every Pod can reach everything.
+#   2. As soon as ONE policy selects a Pod for a direction, that direction is
+#      deny-by-default. Only explicitly allowed traffic passes.
+#   3. There is no "deny" rule. Policies are ADDITIVE: the allowed set is the
+#      union of every policy that selects the Pod. To block one host you must
+#      allow-list everything else.
+#
+# And one prerequisite: your CNI must ENFORCE policies (Calico, Cilium, Antrea,
+# Azure CNI...). Plain flannel accepts these objects and ignores them, which is
+# the worst possible outcome - you would believe you were protected.
+#
+#   kubectl get pods -n kube-system      # look for calico / cilium / antrea
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Deny everything, in both directions, for every Pod in the namespace.
+#    Empty podSelector {} = all Pods. No ingress/egress blocks = allow nothing.
+#
+#    Applying THIS file as-is (before the allow rules below existed) would break
+#    the entire namespace instantly - DNS first, then every API call. That is the
+#    correct mental model: isolation is opt-in per Pod, per direction.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: taskflow
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+
+# -----------------------------------------------------------------------------
+# 2. Allow DNS. Without this, name resolution fails and EVERYTHING else fails
+#    with confusing "no such host" / "Temporary failure in name resolution"
+#    errors that look like an application bug.
+#
+#    DNS is UDP 53 for queries and TCP 53 for large responses / zone transfers.
+#    Allow both.
+#
+#    YAML GOTCHA: namespaceSelector + podSelector inside the SAME `to` item is a
+#    logical AND ("Pods in kube-system labelled kube-dns"). Put them in two
+#    separate items and it becomes OR ("any Pod in kube-system, or any kube-dns
+#    Pod anywhere"). The indentation decides your security posture - read it twice.
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: taskflow
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+
+# -----------------------------------------------------------------------------
+# 3. Let the NODE reach the Pods for HTTP/TCP probes.
+#
+#    This is the trap that turns a healthy app into CrashLoopBackOff the moment
+#    you apply default-deny: liveness and readiness probes come from the kubelet
+#    on the Node, NOT from a Pod, so no podSelector can allow them.
+#
+#    (exec probes are unaffected - they go through the kubelet's CRI stream, not
+#    the network. That is why postgres and the worker in this lab are fine.)
+#
+#    In production, scope this to your node CIDR. The ranges below cover
+#    minikube (192.168.49.0/24), kind (172.18.0.0/16) and Docker Desktop.
+#
+#    If probes still fail after this, find the SOURCE ip the kubelet uses:
+#      kubectl get events -n taskflow --field-selector reason=Unhealthy
+#      kubectl describe pod <pod> -n taskflow      # look for "Probe failed"
+#    then add that CIDR here. Do NOT add the Pod CIDR - that would allow every
+#    Pod in the cluster into the API and defeat the point of this section.
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-probes-from-node
+  namespace: taskflow
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: ["backend", "cache"]     # taskflow-api :8080, redis :6379
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: { cidr: 192.168.0.0/16 }
+        - ipBlock: { cidr: 172.16.0.0/12 }
+      ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 6379 }
+
+# -----------------------------------------------------------------------------
+# 4. The ONLY thing outside the namespace allowed to call the API: the ingress
+#    controller. Note that this selects a NAMESPACE, not the internet - so
+#    external traffic can still reach the cluster, but only through the front
+#    door, and only if the Ingress routes it here.
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-from-controller
+  namespace: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - { protocol: TCP, port: 8080 }
+
+# -----------------------------------------------------------------------------
+# 5. Ingress to the data tier: only from the workloads that need it.
+#    Postgres accepts connections from the API and nothing else.
+#    Redis accepts connections from the API and the worker.
+#
+#    Note that these are INGRESS rules here plus EGRESS rules below. A connection
+#    needs BOTH sides to allow it - the source must be allowed out and the
+#    destination must be allowed in. Forgetting one side is the second most
+#    common NetworkPolicy bug.
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgres-ingress
+  namespace: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: taskflow-api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: taskflow-migrate
+      ports:
+        - { protocol: TCP, port: 5432 }
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-redis-ingress
+  namespace: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: taskflow-api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: taskflow-worker
+      ports:
+        - { protocol: TCP, port: 6379 }
+
+# -----------------------------------------------------------------------------
+# 6. The workload egress rules - the actual answer to "what can reach the
+#    internet from our cluster?".
+#
+#    Only the API may leave on 443, and only to genuinely external addresses:
+#    the `except` list removes the in-cluster ranges, so this rule cannot be used
+#    to reach Postgres or Redis by IP. The worker gets no internet access at all.
+#
+#    NetworkPolicy speaks IPs, never hostnames - you cannot write "allow
+#    api.github.com". For domain-based egress you need Cilium's toFQDNs, an HTTP
+#    forward proxy, or a service mesh ServiceEntry.
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-egress
+  namespace: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-api
+  policyTypes: [Egress]
+  egress:
+    # 6a. the database
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - { protocol: TCP, port: 5432 }
+    # 6b. the queue
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - { protocol: TCP, port: 6379 }
+    # 6c. ONE external destination: HTTPS only, and never in-cluster addresses.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - { protocol: TCP, port: 443 }
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-worker-egress
+  namespace: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - { protocol: TCP, port: 6379 }
+    # No internet egress. If the worker ever needs to call a third party, add a
+    # narrow ipBlock rule here - and notice that you must know the IPs.
+
+# -----------------------------------------------------------------------------
+# 7. The migration Job also talks to the database, so it needs its own egress rule.
+#
+#    This is the pattern that catches everyone: a NetworkPolicy is scoped to a
+#    Pod SELECTOR, so every new workload that needs a new connection needs a new
+#    rule. "I deployed a job and it cannot reach the database" is almost always a
+#    missing egress policy, not a database problem.
+#
+#    Note what is MISSING here on purpose: there is no rule for taskflow-cleanup.
+#    Step 12 makes you discover and fix that yourself.
+# -----------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-migrate-egress
+  namespace: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-migrate
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - { protocol: TCP, port: 5432 }
+
+# -----------------------------------------------------------------------------
+# Debugging NetworkPolicy is done with a "can I reach it?" test, not by reading
+# YAML. A timeout means DROPPED (a policy). A refusal means REACHED (a port).
+#
+#   kubectl run netshoot --rm -it --image=nicolaka/netshoot --restart=Never -n taskflow -- bash
+#   # inside:
+#   nslookup kubernetes.default.svc.cluster.local     # DNS allowed?
+#   nc -zv postgres 5432                              # DB allowed?
+#   curl -sS -m 5 https://api.github.com/zen           # internet allowed?
+#
+# This throwaway Pod is itself covered by default-deny-all (empty podSelector
+# matches every Pod, including new ones), so it can ONLY do DNS. Use it to prove
+# the deny is real, then delete it.
+# -----------------------------------------------------------------------------

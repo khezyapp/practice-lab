@@ -1,0 +1,194 @@
+# =============================================================================
+# Step 07 - Postgres: the workload that needs identity and storage.
+#
+#   kubectl apply -f labs/07-postgres.yaml
+#   kubectl rollout status statefulset/postgres -n taskflow --timeout=180s
+#
+# Three objects:
+#   1. a HEADLESS Service  - per-Pod DNS names, no load balancing
+#   2. a StatefulSet       - stable name (postgres-0) + its own PersistentVolume
+#   3. a Job               - creates the schema, runs once, then stops
+#
+# Read docs/concepts/07-statefulset.md before this step if the Service-type
+# difference (.spec.clusterIP: None) is unfamiliar.
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: taskflow
+spec:
+  # HEADLESS: no virtual IP, no load balancing. DNS instead returns one A record
+  # per Pod, which is what makes postgres-0.postgres.taskflow.svc... a meaningful,
+  # stable address that survives rescheduling.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: taskflow
+spec:
+  # REQUIRED: names the headless Service that governs per-Pod DNS.
+  serviceName: postgres
+  replicas: 1
+  podManagementPolicy: OrderedReady      # 0 must be Ready before 1 is created
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: taskflow
+    spec:
+      terminationGracePeriodSeconds: 60  # let Postgres shut down cleanly
+      securityContext:
+        # Makes the freshly-provisioned volume group-writable by gid 999, which is
+        # the `postgres` user's group in the official image. Omit this and you get
+        # "initdb: could not change permissions of directory" / permission denied.
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: pg
+              containerPort: 5432
+          env:
+            # PGDATA in a SUBDIRECTORY: some volume plugins create a lost+found at
+            # the mount root, and initdb refuses to initialise a non-empty directory.
+            # This single line prevents a very confusing first-boot failure.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef: { name: taskflow-config, key: DB_NAME }
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef: { name: taskflow-config, key: DB_USER }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: taskflow-secret, key: DB_PASSWORD }
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+          # Give initdb a generous budget without weakening anything else.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "taskflow", "-d", "taskflow"]
+            periodSeconds: 5
+            failureThreshold: 30         # up to 150s for first-time initdb
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "taskflow", "-d", "taskflow"]
+            periodSeconds: 5
+          # NOTE: deliberately NO livenessProbe. A liveness probe on a database
+          # tends to restart exactly when it is under load and least able to
+          # recover - which is how a slow query becomes a data-availability
+          # incident. Use readiness + an operator + alerting instead.
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+
+  # One PVC per replica, created from this template and BOUND TO THAT ORDINAL.
+  # They are named data-postgres-0, data-postgres-1, ... and are NOT deleted when
+  # the StatefulSet is deleted. That is deliberate protection, and it also means
+  # cleaning up is your job.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: postgres
+          app.kubernetes.io/part-of: taskflow
+      spec:
+        accessModes: ["ReadWriteOnce"]     # one NODE, not one Pod
+        resources:
+          requests:
+            storage: 2Gi
+        # No storageClassName on purpose: the cluster's default class is used, so
+        # this works unchanged on minikube (standard) and Docker Desktop (hostpath).
+        # In production you NAME the class so a default change cannot silently
+        # re-provision your database onto different hardware.
+
+# -----------------------------------------------------------------------------
+# The schema migration: work that must run ONCE and FINISH.
+#
+# A Deployment is wrong for this (it would restart the container forever), and a
+# bare Pod is worse (no retries, no completion tracking). A Job gives you retries,
+# a completion condition, and a deadline.
+#
+# The app's `migrate` mode is idempotent (CREATE TABLE IF NOT EXISTS + an
+# ON CONFLICT DO NOTHING version insert), which is a requirement, not a nicety:
+# Jobs run at least once, and you WILL re-run this by hand.
+# -----------------------------------------------------------------------------
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: taskflow-migrate
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-migrate
+    app.kubernetes.io/component: migration
+    app.kubernetes.io/part-of: taskflow
+spec:
+  backoffLimit: 6                  # retries if Postgres is still booting
+  activeDeadlineSeconds: 600       # never hang forever
+  # ttlSecondsAfterFinished: 1800  # uncomment in a long-lived cluster to auto-clean
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taskflow-migrate
+        app.kubernetes.io/component: migration
+        app.kubernetes.io/part-of: taskflow
+    spec:
+      restartPolicy: OnFailure     # REQUIRED for a Job: Never or OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: taskflow-api:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "app.py", "migrate"]
+          envFrom:
+            - configMapRef:
+                name: taskflow-config
+            - secretRef:
+                name: taskflow-secret
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+
+# -----------------------------------------------------------------------------
+# Prove the identity and the storage, in three commands:
+#
+#   kubectl get pvc -n taskflow                 # data-postgres-0 should be Bound
+#   kubectl delete pod postgres-0 -n taskflow   # same name comes back...
+#   kubectl get pvc -n taskflow                 # ...with the SAME volume
+#
+# Connect to the exact replica by its stable DNS name:
+#   kubectl run psql --rm -it --image=postgres:16-alpine -n taskflow -- \
+#     psql -h postgres-0.postgres -U taskflow -d taskflow -c "\dt"
+#
+# Then restart the app Pods so they reconnect now that the DB is up:
+#   kubectl rollout restart deployment/taskflow-api -n taskflow
+# -----------------------------------------------------------------------------

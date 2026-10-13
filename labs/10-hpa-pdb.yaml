@@ -1,0 +1,104 @@
+# =============================================================================
+# Step 10 - staying available under load and under maintenance.
+#
+#   kubectl apply -f labs/10-hpa-pdb.yaml
+#
+# Two objects that are about different things:
+#   HPA - how many Pods SHOULD exist, based on demand
+#   PDB - how many Pods MUST stay up when something voluntarily disrupts them
+#         (a node drain, a cluster upgrade, a node pool resize)
+# =============================================================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: taskflow-api
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-api
+    app.kubernetes.io/part-of: taskflow
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: taskflow-api
+  minReplicas: 2
+  maxReplicas: 6                # 6 x 100m request = 600m, inside the namespace quota
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          # Utilization is a PERCENTAGE OF THE REQUEST, which is why an HPA on a
+          # Deployment with no CPU requests can never produce a number. With
+          # requests: 100m, 70% means "scale up when average usage passes 70m".
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    # Scale in slowly: removing capacity during a brief traffic dip is how you
+    # cause the outage you were trying to avoid.
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - { type: Percent, value: 50, periodSeconds: 60 }
+    # Scale out fast: users are already waiting.
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+        - { type: Pods,    value: 2,   periodSeconds: 30 }
+      selectPolicy: Max
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: taskflow-api
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-api
+    app.kubernetes.io/part-of: taskflow
+spec:
+  # With replicas: 3, this permits exactly one Pod to be voluntarily disrupted at
+  # a time. It does NOT protect against a Node crashing, an OOM kill, or a
+  # container crash - only against deliberate eviction (drain / upgrade).
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-api
+
+# -----------------------------------------------------------------------------
+# Things to try, and what they teach:
+#
+# 1. Wait a minute, then:
+#      kubectl get hpa -n taskflow
+#    TARGETS must not say <unknown>. If it does, metrics-server is missing/broken
+#    or the Deployment has no CPU requests.
+#
+# 2. Generate load and watch it scale out:
+#      kubectl run loadgen --rm -it --image=busybox:1.36 --restart=Never -n taskflow -- \
+#        sh -c "while true; do wget -q -O- http://taskflow-api/api/tasks >/dev/null; done"
+#      kubectl get hpa,pods -n taskflow -w
+#    Note: request/connection-based load on a fast endpoint may not move CPU much.
+#    That is itself a lesson - CPU is often the wrong scaling signal, which is why
+#    real systems scale the WORKER on queue depth instead (KEDA + Redis).
+#
+# 3. Drain the node and watch the PDB protect availability:
+#      kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+#      kubectl get pdb -n taskflow -w
+#    On a single-node cluster the drain will BLOCK because evicting anything takes
+#    you below minAvailable. That is the PDB working exactly as designed - and it
+#    is also why a PDB with minAvailable == replicas will stall your cluster
+#    upgrades forever. Leave headroom.
+#
+#      kubectl uncordon <node>
+#
+# 4. Combine with the rollout behaviour from step 04:
+#      kubectl set image deploy/taskflow-api api=taskflow-api:1.1.0 -n taskflow
+#      kubectl rollout status deploy/taskflow-api -n taskflow
+#      kubectl rollout undo deploy/taskflow-api -n taskflow
+#
+# Scaling to zero (cost saving) and scaling on queue depth are done with KEDA or
+# by scaling the WORKER Deployment on a custom metric. HPA alone cannot see a
+# Redis queue length.
+# -----------------------------------------------------------------------------
