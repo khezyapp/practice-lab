@@ -224,5 +224,5 @@ ReplicaSet → Deployment, which is a nice way to *see* the object graph from la
 
 ---
 
-**Back to:** [Docs index](../README.md) ·
+**Back to:** [Course overview](../overview.md) ·
 **Now go do it:** [Lab step 00 — Scenario & requirements](../lab/00-scenario-and-requirements.md)

@@ -1,6 +1,6 @@
-# Kubernetes Practice Lab — From Zero to a Production-like App
+# Course overview
 
-This folder is a **self-paced Kubernetes course**. It has two halves:
+This is a **self-paced Kubernetes course**. It has two halves:
 
 1. **Concepts** — short, ordered lessons that explain what each Kubernetes object is,
    what problem it solves, and how it fits into the life of a real request.
@@ -242,8 +242,9 @@ every real-world concern to appear:
 - one public hostname with TLS → **Ingress**,
 - calls to a third-party API → **Egress + NetworkPolicy**.
 
-Its source code lives in [`labs/app/`](../labs/app/) and is small enough to read in one
-sitting.
+Its source code lives in
+[`labs/app/`](https://github.com/khezyapp/practice-lab/tree/main/labs/app) and is small
+enough to read in one sitting.
 
 ---
 

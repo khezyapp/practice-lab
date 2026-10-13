@@ -273,12 +273,14 @@ a production role.
 
 ```
 docs/
-  README.md                     index, learning path, progress checklist
+  index.md                      landing page
+  overview.md                   course overview, learning path, progress checklist
   getting-started/              local cluster, kubectl, the mental model
   concepts/                     13 lessons, one per Kubernetes object
   architecture/                 request lifecycle, what happens on apply
   lab/                          the 13 steps you just finished
   reference/                    kubectl cheatsheet, glossary, interview questions
+  .vitepress/                   the VitePress site config and theme
 labs/
   README.md                     apply order, teardown
   app/                          the TaskFlow source and Dockerfile

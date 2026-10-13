@@ -28,9 +28,9 @@ Expected: one node named `taskflow` with `STATUS  Ready` and `ROLES  control-pla
 
 > **Size the cluster to fit Docker Desktop.** `--memory=5120` (5 GiB) works on this
 > machine because Docker Desktop has about 7.6 GiB to hand out, and 4 CPUs out of 8.
-> Check yours with `docker info --format '{{.MemTotal}}'` — if you ask minikube for
-> more memory than the Docker engine has, it fails to start with an error that does
-> not obviously say so. Running the lab comfortably needs at least 4 GiB.
+> Check yours with <code v-pre>docker info --format '{{.MemTotal}}'</code> — if you ask
+> minikube for more memory than the Docker engine has, it fails to start with an error
+> that does not obviously say so. Running the lab comfortably needs at least 4 GiB.
 
 > `--driver=docker` reuses the Docker Desktop engine you already have running, so no
 > extra VM software is needed.

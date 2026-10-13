@@ -37,7 +37,9 @@ on your laptop and in production. Nothing about the environment is baked in — 
 hard-coded DB host, no secret in the image. Config arrives at runtime
 ([ConfigMaps/Secrets](../concepts/09-configmaps-and-secrets.md)).
 
-> The lab's app lives in [`labs/app/`](../../labs/app/). Read it once; it is small.
+> The lab's app lives in
+> [`labs/app/`](https://github.com/khezyapp/practice-lab/tree/main/labs/app). Read it
+> once; it is small.
 
 ## Step 2 — A container is not enough, so wrap it in a Pod
 
@@ -304,7 +306,7 @@ flowchart TB
 
 1. [What is Kubernetes](../concepts/01-what-is-kubernetes.md) — the machinery that makes
    the above possible: control plane, Nodes, kubelet, etcd, scheduler.
-2. Then follow the [concept lessons](../README.md#3-learning-path) in order, doing the
+2. Then follow the [concept lessons](../overview.md#_3-learning-path) in order, doing the
    matching [lab step](../lab/00-scenario-and-requirements.md) after each one.
 3. When something is unclear, read
    [the request lifecycle](../architecture/01-request-lifecycle.md) — it traces one HTTP
